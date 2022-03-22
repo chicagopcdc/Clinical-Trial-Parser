@@ -10,47 +10,60 @@ set -eu
 
 OUTPUT="data/input/clinical_trials.csv"
 DB=aact
-LIMIT=10
+LIMIT=10000
+PIPE_DELIM_CONDITIONS="acute myeloid leukemia|aml"
 
 QUERY() {
   echo "\COPY (
-  SELECT
-      t1.nct_id AS \"#nct_id\",
-      t1.brief_title AS title,
-      CASE WHEN t2.has_us_facility THEN 'true' ELSE 'false' END AS has_us_facility,
-      t3.conditions,
-      t4.criteria AS eligibility_criteria
-  FROM studies t1
-  JOIN calculated_values t2
-      ON t1.nct_id = t2.nct_id
-  JOIN (
-      SELECT
-          nct_id,
-          STRING_AGG(name, '|' ORDER BY name) AS conditions
-      FROM conditions
-      GROUP BY
-          nct_id
-  ) t3
-      ON t1.nct_id = t3.nct_id
-  JOIN eligibilities t4
-      ON t1.nct_id = t4.nct_id
-  WHERE
-      LOWER(conditions) ${1} '%([^a-z]cov[^a-z]|corona[ v]|covid)%'
-      AND t1.study_type = 'Interventional'
-      AND t1.overall_status = 'Recruiting'
-      AND RANDOM() < 0.2
-  ORDER BY
-      t1.nct_id DESC
-  LIMIT
-      ${LIMIT}
+    with minage_years (nct_id, age) as (
+        select nct_id
+            , CASE WHEN ctgov.eligibilities.minimum_age like '%Month%' THEN FLOOR(CAST(substring(ctgov.eligibilities.minimum_age, 1, POSITION('Month' in ctgov.eligibilities.minimum_age)-1) as int) / 12.0)
+                WHEN ctgov.eligibilities.minimum_age like '%Year%' THEN CAST(substring(ctgov.eligibilities.minimum_age, 1, POSITION('Year' in ctgov.eligibilities.minimum_age)-1) as int)
+                WHEN ctgov.eligibilities.minimum_age='N/A' then 0
+                END as minage_years 
+        from ctgov.eligibilities
+        )
+        , maxage_years (nct_id, age) as (
+        select nct_id
+            , CASE WHEN ctgov.eligibilities.maximum_age like '%Month%' THEN FLOOR(CAST(substring(ctgov.eligibilities.maximum_age, 1, POSITION('Month' in ctgov.eligibilities.maximum_age)-1) as int) / 12.0)
+                WHEN ctgov.eligibilities.maximum_age like '%Year%' THEN CAST(substring(ctgov.eligibilities.maximum_age, 1, POSITION('Year' in ctgov.eligibilities.maximum_age)-1) as int)
+                WHEN ctgov.eligibilities.maximum_age='N/A' then 999
+                END as maxage_years 
+        from ctgov.eligibilities
+        )
+        , aggr_conditions (nct_id, conditions) as (
+        SELECT nct_id
+            , STRING_AGG(name, '|' ORDER BY name) AS conditions 
+        FROM conditions 
+        GROUP BY nct_id
+        )
+    SELECT studies.nct_id AS \"#nct_id\"
+        , studies.brief_title AS title
+        , CASE WHEN calculated_values.has_us_facility THEN 'true' ELSE 'false' END AS has_us_facility
+        , aggr_conditions.conditions
+        , eligibilities.criteria AS eligibility_criteria
+        , minage_years.age as minimum_age
+        , maxage_years.age as maximum_age
+    FROM studies
+        JOIN calculated_values ON studies.nct_id = calculated_values.nct_id
+        JOIN aggr_conditions ON studies.nct_id = aggr_conditions.nct_id
+        JOIN eligibilities ON studies.nct_id = eligibilities.nct_id
+        join minage_years on minage_years.nct_id=studies.nct_id
+        join maxage_years on maxage_years.nct_id=studies.nct_id
+    WHERE
+        LOWER(conditions) ${1} '%($PIPE_DELIM_CONDITIONS)%'
+        AND studies.study_type = 'Interventional'
+        AND studies.overall_status in ('Recruiting', 'Active, not recruiting')
+        and minage_years.age <24
+        and calculated_values.has_us_facility
+    ORDER BY studies.nct_id DESC      
+    LIMIT ${LIMIT}
   )
   TO STDOUT WITH (FORMAT csv, HEADER)
   "
 }
 
-# Extract COVID-19 related trials
+
 psql -U "$USER" -d "$DB" -c "$(QUERY "SIMILAR TO")" > "$OUTPUT"
-# Extract non-COVID-19 related trials
-psql -U "$USER" -d "$DB" -c "$(QUERY "NOT SIMILAR TO")" >> "$OUTPUT"
 
 wc -l "$OUTPUT"
